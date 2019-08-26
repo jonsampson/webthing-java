@@ -3,23 +3,28 @@
  */
 package org.mozilla.iot.webthing;
 
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
-import org.mozilla.iot.webthing.errors.PropertyError;
-
+import java.io.Closeable;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
 
 import javax.jmdns.JmDNS;
+import javax.jmdns.JmDNS.Delegate;
 import javax.jmdns.ServiceInfo;
 import javax.net.ssl.SSLServerSocketFactory;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.mozilla.iot.webthing.errors.PropertyError;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import fi.iki.elonen.NanoHTTPD;
 import fi.iki.elonen.NanoWSD;
@@ -39,6 +44,7 @@ public class WebThingServer extends RouterNanoHTTPD {
     private List<String> hosts;
     private boolean isTls;
     private JmDNS jmdns;
+    private Logger logger;
 
     /**
      * Initialize the WebThingServer on port 80.
@@ -272,7 +278,11 @@ public class WebThingServer extends RouterNanoHTTPD {
         }
 
         setNotFoundHandler(Error404UriHandler.class);
+        
+        this.logger = LoggerFactory.getLogger(getClass());
     }
+    
+    private Delegate recoveryDelegate = null;
 
     /**
      * Start listening for incoming connections.
@@ -281,26 +291,76 @@ public class WebThingServer extends RouterNanoHTTPD {
      * @throws IOException on failure to listen on port
      */
     public void start(boolean daemon) throws IOException {
-        this.jmdns = JmDNS.create(hostname == null ?
-                                  InetAddress.getLocalHost() :
-                                  InetAddress.getByName(hostname));
 
-        String systemHostname = this.jmdns.getHostName();
-        if (systemHostname.endsWith(".")) {
-            systemHostname =
-                    systemHostname.substring(0, systemHostname.length() - 1);
-        }
-        this.hosts.add(systemHostname);
-        this.hosts.add(String.format("%s:%d", systemHostname, this.port));
+		this.logger.warn("WebThingServer.start invoked");
+    	this.recoveryDelegate = new Delegate() {
+    		@Override
+    		public void cannotRecoverFromIOError(JmDNS dns, Collection<ServiceInfo> infos) {
+    			WebThingServer.this.logger.warn("WebThingServer.recoveryDelegate.cannotRecoverFromIOError() invoked");
+    			WebThingServer.this.logger.warn("WebThingServer.recoveryDelegate.cannotRecoverFromIOError() jmdns is null: " + Boolean.toString(dns == null));
+    			WebThingServer.this.logger.warn("WebThingServer.recoveryDelegate.cannotRecoverFromIOError() infos: " + ((infos != null) ? infos.size() + " " + infos.toString() : ""));
+				try {
+					if(dns != null) {
+		    			dns.setDelegate(null);
+		    			if(dns instanceof Closeable) {
+		        				dns.close();	
+		    			}
+		    			else {
+		    				dns.unregisterAllServices();
+		    			}
+					}
+				}
+				catch(Exception e) {
+					WebThingServer.this.logger.warn("WebThingServer.recoveryDelegate.cannotRecoverFromIOError() exception on jmdns closure reached");
+					e.printStackTrace();
+				}
+				try {
+					WebThingServer.this.jmdns = getNewJmDNS(infos.toArray(new ServiceInfo[0]));
+				}
+				catch(Exception e) {
+					WebThingServer.this.logger.warn("WebThingServer.recoveryDelegate.cannotRecoverFromIOError() exception on reinit reached");
+					e.printStackTrace();
+					try {
+						Thread.sleep(60000);
+					}
+					catch(InterruptedException ie) {
+						ie.printStackTrace();
+					}
+					cannotRecoverFromIOError(WebThingServer.this.jmdns, infos);
+				}
+    		}
+    	};
+		
+		ServiceInfo serviceInfo = ServiceInfo.create("_webthing._tcp.local",
+		                                   this.name,
+		                                   null,
+		                                   this.port,
+		                                   "path=/");
+		this.jmdns = getNewJmDNS(serviceInfo);
 
-        ServiceInfo serviceInfo = ServiceInfo.create("_webthing._tcp.local",
-                                                     this.name,
-                                                     null,
-                                                     this.port,
-                                                     "path=/");
-        this.jmdns.registerService(serviceInfo);
-
+		String systemHostname = this.jmdns.getHostName();
+		if (systemHostname.endsWith(".")) {
+			systemHostname = systemHostname.substring(0, systemHostname.length() - 1);
+		}
+		this.hosts.add(systemHostname);
+		this.hosts.add(String.format("%s:%d", systemHostname, this.port));
+		
         super.start(this.SOCKET_READ_TIMEOUT, daemon);
+
+		this.logger.warn("WebThingServer.started");
+    }
+    
+    protected JmDNS getNewJmDNS(ServiceInfo... serviceInfos) throws IOException {
+    	JmDNS toReturn = JmDNS.create(this.hostname == null ?
+                InetAddress.getLocalHost() :
+                InetAddress.getByName(this.hostname));
+    	
+    	toReturn.setDelegate(this.recoveryDelegate);
+    	
+    	for(ServiceInfo serviceInfo : serviceInfos) {
+    		toReturn.registerService(serviceInfo);
+    	}
+    	return toReturn;
     }
 
     /**
